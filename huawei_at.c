@@ -239,6 +239,9 @@ void scan_huawei_devices(libusb_context *ctx) {
     
     if (!found) {
         fprintf(stderr, "  No Huawei devices found\n");
+        if (geteuid() != 0) {
+            fprintf(stderr, "  (Recent macOS hides some Huawei devices from non-root users - try sudo)\n");
+        }
     }
     
     libusb_free_device_list(devs, 1);

@@ -51,11 +51,40 @@ Switch Huawei modems from ZeroCD/Storage mode to Modem mode.
 ./bin/huawei_modeswitch -l
 
 # Auto-switch any ZeroCD device found
-./bin/huawei_modeswitch
+sudo ./bin/huawei_modeswitch
 
 # Force specific PID
-./bin/huawei_modeswitch -p 14fe
+sudo ./bin/huawei_modeswitch -p 14fe
 ```
+
+> **Note:** On recent macOS versions, some Huawei devices are flagged as needing a
+> device-access entitlement (`NeedsDeviceAccessEntitlement = Yes` in `ioreg`). libusb
+> cannot open them as a regular user and silently leaves them out of the device list,
+> so the tools report "No Huawei devices found". Run the tools with `sudo`.
+
+### Example: E3372 (12d1:1f01) to HiLink
+
+```bash
+$ sudo ./bin/huawei_modeswitch
+...
+[Huawei new mode message]
+Sending: 55 53 42 43 12 34 56 78 00 00 00 00 00 00 10 11 06 20 00 00 01 01 00 01 ...
+Success! Sent 31 bytes
+Response: 55 53 42 53 12 34 56 78 00 00 00 00 00
+Device left ZeroCD mode
+...
+Huawei devices found:
+  12d1:14db - E3131/E353 HiLink [Modem Mode]
+
+*** SUCCESS! Device is now in modem mode ***
+```
+
+In HiLink mode the stick works as a USB Ethernet adapter, and macOS sets it up automatically
+(it appears as **HUAWEI_MOBILE** in `networksetup -listallhardwareports`). The modem hands out
+a `192.168.8.x` address, and its web UI (SIM PIN, network settings, signal) is at
+http://192.168.8.1. HiLink devices have no serial port, so `huawei_at` does not apply to them.
+
+The stick starts in ZeroCD mode on every power-up, so run the switch again after replugging.
 
 ## Building
 
@@ -127,8 +156,9 @@ clang -o bin/huawei_modeswitch huawei_modeswitch.c -I/opt/homebrew/include -L/op
 
 ### Device not detected
 1. Check USB connection
-2. Try `./huawei_modeswitch -l` to list devices
-3. If in ZeroCD mode, run `./huawei_modeswitch` first
+2. Try `sudo ./bin/huawei_modeswitch -l` to list devices (see the entitlement note above)
+3. If in ZeroCD mode, run `sudo ./bin/huawei_modeswitch` first
+4. Check that macOS sees the device at all: `ioreg -p IOUSB -l -w0 | grep -A30 HUAWEI`
 
 ### Permission denied
 ```bash

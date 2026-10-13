@@ -79,6 +79,16 @@ static uint16_t modem_pids[] = {
     0
 };
 
+// usb_modeswitch "HuaweiNewMode" message (used for 0x1f01 and most newer devices)
+static unsigned char huawei_new_mode_msg[] = {
+    0x55, 0x53, 0x42, 0x43,  // "USBC"
+    0x12, 0x34, 0x56, 0x78,  // Tag
+    0x00, 0x00, 0x00, 0x00,  // Transfer length
+    0x00, 0x00, 0x10,        // Flags, LUN, CDB length (max 16 per BOT spec)
+    0x11, 0x06, 0x20, 0x00, 0x00, 0x01, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
 // Standard SCSI commands wrapped in USB Mass Storage CBW
 static unsigned char huawei_switch_msg[] = {
     0x55, 0x53, 0x42, 0x43,  // "USBC" signature
@@ -86,7 +96,7 @@ static unsigned char huawei_switch_msg[] = {
     0x00, 0x00, 0x00, 0x00,  // Data transfer length
     0x00,                     // Flags (OUT)
     0x00,                     // LUN
-    0x11,                     // Command length
+    0x10,                     // Command length (max 16 per BOT spec)
     // Huawei specific SCSI command
     0x11, 0x06, 0x20, 0x00, 0x00, 0x01, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -97,7 +107,7 @@ static unsigned char huawei_switch_msg2[] = {
     0x55, 0x53, 0x42, 0x43,  // "USBC"
     0x12, 0x34, 0x56, 0x79,  // Tag
     0x00, 0x00, 0x00, 0x00,  // Transfer length
-    0x00, 0x00, 0x11,        // Flags, LUN, CDB length
+    0x00, 0x00, 0x10,        // Flags, LUN, CDB length (max 16 per BOT spec)
     0x11, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
@@ -240,7 +250,79 @@ int find_bulk_out_endpoint(libusb_device *dev, int *out_interface) {
     return ep_out;
 }
 
-int try_bulk_transfer(libusb_device_handle *handle, int ep_out, unsigned char* msg, int msg_len, const char* desc) {
+int find_bulk_in_endpoint(libusb_device *dev, int interface_num) {
+    struct libusb_config_descriptor *config;
+    if (libusb_get_active_config_descriptor(dev, &config) < 0) return -1;
+    
+    int ep_in = -1;
+    for (int i = 0; i < config->bNumInterfaces && ep_in < 0; i++) {
+        const struct libusb_interface *iface = &config->interface[i];
+        for (int j = 0; j < iface->num_altsetting && ep_in < 0; j++) {
+            const struct libusb_interface_descriptor *setting = &iface->altsetting[j];
+            if (setting->bInterfaceNumber != interface_num) continue;
+            for (int k = 0; k < setting->bNumEndpoints; k++) {
+                const struct libusb_endpoint_descriptor *ep = &setting->endpoint[k];
+                if ((ep->bmAttributes & 0x03) == LIBUSB_TRANSFER_TYPE_BULK &&
+                    (ep->bEndpointAddress & 0x80)) {
+                    ep_in = ep->bEndpointAddress;
+                    break;
+                }
+            }
+        }
+    }
+    
+    libusb_free_config_descriptor(config);
+    return ep_in;
+}
+
+// Returns 1 if a device with this VID:PID is currently on the bus
+int device_present(libusb_context *ctx, uint16_t pid) {
+    libusb_device **devs;
+    ssize_t cnt = libusb_get_device_list(ctx, &devs);
+    int present = 0;
+    
+    for (ssize_t i = 0; i < cnt; i++) {
+        struct libusb_device_descriptor desc;
+        libusb_get_device_descriptor(devs[i], &desc);
+        if (desc.idVendor == HUAWEI_VENDOR_ID && desc.idProduct == pid) {
+            present = 1;
+            break;
+        }
+    }
+    
+    libusb_free_device_list(devs, 1);
+    return present;
+}
+
+// Returns 1 if any Huawei device in modem mode is on the bus
+int modem_present(libusb_context *ctx) {
+    libusb_device **devs;
+    ssize_t cnt = libusb_get_device_list(ctx, &devs);
+    int present = 0;
+    
+    for (ssize_t i = 0; i < cnt; i++) {
+        struct libusb_device_descriptor desc;
+        libusb_get_device_descriptor(devs[i], &desc);
+        if (desc.idVendor == HUAWEI_VENDOR_ID && is_modem_pid(desc.idProduct)) {
+            present = 1;
+            break;
+        }
+    }
+    
+    libusb_free_device_list(devs, 1);
+    return present;
+}
+
+// Waits up to timeout_sec for the device to drop off the bus
+int wait_for_disconnect(libusb_context *ctx, uint16_t pid, int timeout_sec) {
+    for (int i = 0; i < timeout_sec * 2; i++) {
+        if (!device_present(ctx, pid)) return 1;
+        usleep(500000);
+    }
+    return 0;
+}
+
+int try_bulk_transfer(libusb_device_handle *handle, int ep_out, int ep_in, unsigned char* msg, int msg_len, const char* desc) {
     int transferred;
     int r;
     
@@ -248,13 +330,41 @@ int try_bulk_transfer(libusb_device_handle *handle, int ep_out, unsigned char* m
     print_hex("Sending", msg, msg_len);
     
     r = libusb_bulk_transfer(handle, ep_out, msg, msg_len, &transferred, 2000);
-    if (r == 0) {
-        printf("Success! Sent %d bytes\n", transferred);
-        return 0;
-    } else {
+    if (r == LIBUSB_ERROR_PIPE) {
+        // Endpoint stalled - clear the halt and retry once
+        printf("Stalled, clearing halt and retrying...\n");
+        libusb_clear_halt(handle, ep_out);
+        r = libusb_bulk_transfer(handle, ep_out, msg, msg_len, &transferred, 2000);
+    }
+    if (r == LIBUSB_ERROR_NO_DEVICE) {
+        printf("Device disconnected (mode switch may have worked!)\n");
+        return 1;
+    }
+    if (r != 0) {
         printf("Failed: %s\n", libusb_strerror(r));
+        libusb_clear_halt(handle, ep_out);
         return -1;
     }
+    printf("Success! Sent %d bytes\n", transferred);
+    
+    // Read the 13-byte Command Status Wrapper so the device sees a complete command
+    if (ep_in >= 0) {
+        unsigned char csw[13];
+        r = libusb_bulk_transfer(handle, ep_in, csw, sizeof(csw), &transferred, 2000);
+        if (r == LIBUSB_ERROR_PIPE) {
+            libusb_clear_halt(handle, ep_in);
+            r = libusb_bulk_transfer(handle, ep_in, csw, sizeof(csw), &transferred, 2000);
+        }
+        if (r == 0) {
+            print_hex("Response", csw, transferred);
+        } else if (r == LIBUSB_ERROR_NO_DEVICE) {
+            printf("Device disconnected (mode switch may have worked!)\n");
+            return 1;
+        } else {
+            printf("No response: %s\n", libusb_strerror(r));
+        }
+    }
+    return 0;
 }
 
 int try_control_transfer(libusb_device_handle *handle) {
@@ -319,6 +429,9 @@ void scan_huawei_devices(libusb_context *ctx, int *found_zerocd, int *found_mode
     
     if (!found) {
         printf("  No Huawei devices found\n");
+        if (geteuid() != 0) {
+            printf("  (Recent macOS hides some Huawei devices from non-root users - try sudo)\n");
+        }
     }
     
     libusb_free_device_list(devs, 1);
@@ -400,12 +513,31 @@ int switch_device(libusb_context *ctx, libusb_device_handle *handle, uint16_t pi
         printf("Interface claimed successfully\n");
         
         if (ep_out >= 0) {
-            // Try bulk transfers
-            try_bulk_transfer(handle, ep_out, huawei_switch_msg, sizeof(huawei_switch_msg), "Huawei switch message 1");
-            usleep(500000);
-            try_bulk_transfer(handle, ep_out, huawei_switch_msg2, sizeof(huawei_switch_msg2), "Huawei switch message 2");
-            usleep(500000);
-            try_bulk_transfer(handle, ep_out, eject_msg, sizeof(eject_msg), "Eject message");
+            int ep_in = find_bulk_in_endpoint(dev, interface_num);
+            
+            // macOS often leaves the bulk endpoints halted after claiming
+            libusb_clear_halt(handle, ep_out);
+            if (ep_in >= 0) libusb_clear_halt(handle, ep_in);
+            
+            struct { unsigned char *msg; int len; const char *desc; } msgs[] = {
+                { huawei_new_mode_msg, sizeof(huawei_new_mode_msg), "Huawei new mode message" },
+                { huawei_switch_msg,   sizeof(huawei_switch_msg),   "Huawei switch message 1" },
+                { huawei_switch_msg2,  sizeof(huawei_switch_msg2),  "Huawei switch message 2" },
+                { eject_msg,           sizeof(eject_msg),           "Eject message" },
+            };
+            
+            // Send one message at a time and give the device time to switch before trying the next
+            for (int i = 0; i < 4; i++) {
+                r = try_bulk_transfer(handle, ep_out, ep_in, msgs[i].msg, msgs[i].len, msgs[i].desc);
+                if (r == 1) return 1;
+                if (r == 0) {
+                    printf("Waiting for device to switch...\n");
+                    if (wait_for_disconnect(ctx, pid, 8)) {
+                        printf("Device left ZeroCD mode\n");
+                        return 1;
+                    }
+                }
+            }
         } else {
             // Try common endpoints
             printf("\nNo bulk endpoint found, trying common endpoints...\n");
@@ -508,7 +640,11 @@ int main(int argc, char **argv) {
     }
     
     printf("\n=== Waiting for device to re-enumerate... ===\n");
-    sleep(3);
+    
+    // Modem-mode devices can take 10+ seconds to show up after switching
+    for (int i = 0; i < 20 && !modem_present(ctx); i++) {
+        sleep(1);
+    }
     
     // Check result
     scan_huawei_devices(ctx, &found_zerocd, &found_modem);
